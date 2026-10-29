@@ -1,0 +1,116 @@
+name: Release
+
+# Dispatched by hand, as in e2b-dev/eve-sandbox: merging a changeset never
+# publishes. With no pending changeset the run is a green no-op.
+on:
+  workflow_dispatch: {}
+
+concurrency: release-${{ github.ref }}
+
+permissions:
+  contents: write # push the version bump and create the GitHub release
+  id-token: write # npm trusted publishing (OIDC), no token stored anywhere
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - name: Check the ref
+        # The dispatch picker offers every branch; a feature branch must not publish.
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Releases must run on main; this run is on ${REF}."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Check for pending changesets
+        id: version
+        run: echo "release=$(./.github/scripts/is_release.sh)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: [preflight]
+    if: needs.preflight.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish
+    needs: [preflight, test]
+    if: (!cancelled()) && !contains(needs.*.result, 'failure') && needs.preflight.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # The `deployment` environment only allows main, and the npm trusted
+    # publisher is pinned to it, so a workflow edited on a branch cannot publish.
+    environment: deployment
+    steps:
+      # The app token pushes the version bump past branch protection on main.
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.VERSION_BUMPER_APPID }}
+          private-key: ${{ secrets.VERSION_BUMPER_SECRET }}
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm (required for trusted publishing)
+        run: npm install -g npm@^11.6
+
+      - run: bun install --frozen-lockfile
+
+      - name: Create new version
+        run: bun run version
+
+      - name: Commit new version
+        # Before publishing: `changeset publish` tags HEAD, so the tag must land on
+        # the bump commit. The commit stays local until something is published.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::'changeset version' produced no changes, so there is nothing to publish."
+            exit 1
+          fi
+          git commit -m "[skip ci] Release new version"
+
+      - name: Publish to npm
+        # Pinned to a commit: the only third-party action in the privileged publish path.
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: bun run release
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: "" # trusted publishing via OIDC, see changesets#1152
+          NPM_CONFIG_PROVENANCE: "true"
+
+      - name: Push new version
+        # Gated on the tag, not on the publish step: if anything was published,
+        # the commit its tag points at has to reach main.
+        if: always()
+        run: |
+          if [ -z "$(git tag --points-at HEAD)" ]; then
+            echo "Nothing was published; the changesets stay for a re-run."
+            exit 0
+          fi
+          if ! git push --follow-tags; then
+            git fetch origin "${GITHUB_REF_NAME}"
+            git merge --no-edit FETCH_HEAD
+            git push --follow-tags
+          fi

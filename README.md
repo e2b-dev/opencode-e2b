@@ -9,19 +9,14 @@ The package's default export carries both entry points: OpenCode 1 calls `server
 
 ## Install
 
-```bash
-bun install
-bun run build
-```
-
-Register the built plugin in your OpenCode config:
+The package is [`@e2b/opencode`](https://www.npmjs.com/package/@e2b/opencode). Register it in your OpenCode config:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "/absolute/path/to/opencode-e2b/dist/index.js",
+      "@e2b/opencode",
       {
         "nodeVariant": "22-slim",
         "sandboxTimeoutMs": 3600000
@@ -53,14 +48,20 @@ Two ways to use E2B with OpenCode 2:
 
 OpenCode runs on your machine. Every shell command that it runs (the agent's and your `!` commands) runs in an E2B sandbox, at the same path as on your machine. Reading and editing files stays local, so diffs, undo and the file picker work as usual.
 
+```bash
+opencode plugin add @e2b/opencode
+```
+
+Or per project, with options:
+
 ```jsonc
 // opencode.jsonc
 {
-  "plugins": [{ "package": "/absolute/path/to/opencode-e2b", "options": { "domain": "e2b-juliett.dev" } }],
+  "plugins": [{ "package": "@e2b/opencode", "options": { "domain": "e2b-juliett.dev" } }],
 }
 ```
 
-Set `E2B_API_KEY`. OpenCode 2 loads a plugin folder from its `index.js`, which re-exports `dist/index.js`, so run `bun run build` first.
+Set `E2B_API_KEY`.
 
 How it works:
 
@@ -100,6 +101,7 @@ Limits: the project must be a git repository; submodule contents and a linked wo
 A box is a sandbox with your project and an OpenCode 2 server in it. The agent keeps working when your laptop sleeps. Each box is one task.
 
 ```bash
+npm install -g @e2b/opencode         # the opencode-e2b command
 opencode-e2b secrets set anthropic   # once: stores ANTHROPIC_API_KEY (or stdin) as an E2B secret
 opencode-e2b box up --attach         # start a box named after the branch, open the TUI on it
 opencode-e2b box pull                # the box's work, uncommitted files too, as branch e2b/<name>
@@ -131,7 +133,11 @@ bun run format:check  # oxfmt
 bun run test
 ```
 
-`bun run check` runs all four. The diagrams are built from `assets/diagrams/*.html` with `assets/diagrams/build.sh`. Lint rules are errors in `src/v2` and `src/index.ts`, and warnings in older code until each rule is cleaned up there. The anti-slop rules are vendored in `tools/oxlint/anti-slop` (see its `VENDOR.md`).
+`bun run check` runs all four. To try a checkout in OpenCode, run `bun install && bun run build` and use the folder's absolute path in place of `@e2b/opencode` in the config.
+
+The diagrams are built from `assets/diagrams/*.html` with `assets/diagrams/build.sh`. Lint rules are errors in `src/v2` and `src/index.ts`, and warnings in older code until each rule is cleaned up there. The anti-slop rules are vendored in `tools/oxlint/anti-slop` (see its `VENDOR.md`).
+
+Releases: add a changeset with `bunx changeset`, merge it, then run `gh workflow run release.yml --ref main`. The workflow versions, publishes to npm over trusted publishing and tags. Do not run `changeset version` locally.
 
 The plugin is loaded by OpenCode's Bun runtime and uses Bun as its development runtime. `bun run test` builds `dist/` first, then runs the Bun test runner against `test/*.test.ts`.
 
