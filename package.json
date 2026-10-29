@@ -1,6 +1,6 @@
 {
   "name": "@e2b/opencode",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "E2B sandboxes for OpenCode: workspaces for OpenCode 1, sandboxed shell commands and boxes for OpenCode 2",
   "keywords": [
     "e2b",
