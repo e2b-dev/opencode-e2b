@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -60,9 +61,20 @@ test("readLocalGitBranch returns undefined for detached HEAD and non-repositorie
   }
 })
 
-test("readLocalGitBranch reads this repository's real branch", async () => {
+test("readLocalGitBranch reads what git itself writes, in a repository and a linked worktree", async () => {
   // Guards the parsing against the actual on-disk format, not just fixtures.
-  const branch = await readLocalGitBranch(process.cwd())
-  assert.ok(typeof branch === "string" && branch.length > 0, `expected a branch, got ${branch}`)
-  assert.doesNotMatch(branch, /^ref:|refs\/heads/)
+  const root = await tempDir()
+  try {
+    const repo = path.join(root, "repo")
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" })
+    await mkdir(repo)
+    git("init", "-q", "-b", "real/branch")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init")
+    git("worktree", "add", "-q", "-b", "linked/branch", path.join(root, "linked"))
+
+    assert.equal(await readLocalGitBranch(repo), "real/branch")
+    assert.equal(await readLocalGitBranch(path.join(root, "linked")), "linked/branch")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
