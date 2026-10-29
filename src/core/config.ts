@@ -1,0 +1,228 @@
+import type {
+  E2BWorkspacePluginOptions,
+  NormalizedE2BWorkspaceConfig,
+  PersistedWorkspaceCompatibility,
+  PersistedWorkspaceExtra,
+  PluginLogger,
+  WorkspaceRef,
+} from "./types.js"
+import { DEFAULT_TEMPLATE_GC_COOLDOWN_MS, DEFAULT_TEMPLATE_GC_TTL_MS, MIN_TEMPLATE_GC_TTL_MS } from "./gc.js"
+
+export { validatePluginOptions } from "./config-validate.js"
+
+export const CURRENT_WORKSPACE_API_VERSION = "1"
+const DEFAULT_NODE_VARIANT = "22-slim"
+
+/**
+ * Used when the host path cannot be mirrored inside the sandbox (see
+ * `mirroredProjectPath`). Sessions then carry a directory the host cannot
+ * resolve, which is why mirroring is preferred.
+ */
+export const FALLBACK_PROJECT_PATH = "/home/user/project"
+
+/**
+ * The sandbox hosts the project at the host's own path so a session's
+ * directory resolves on both sides — OpenCode canonicalises that directory
+ * with realpath, so a symlink from one to the other collapses back to the
+ * sandbox path and the host is left with a path it cannot open.
+ *
+ * Only POSIX-absolute host paths can be mirrored. A Windows path has no form
+ * that is absolute on both systems: `/home/user/project` is legal on Windows
+ * but resolves against the current drive root, so the host would need a
+ * junction at `C:\` to follow it — not something to create on a user's
+ * machine. Those hosts keep FALLBACK_PROJECT_PATH.
+ */
+export function mirroredProjectPath(localDirectory: string | undefined): string | undefined {
+  if (!localDirectory) return undefined
+  if (!localDirectory.startsWith("/")) return undefined
+  if (localDirectory.includes("\\")) return undefined
+  if (/^\/[A-Za-z]:/.test(localDirectory)) return undefined
+  return localDirectory
+}
+
+const DEFAULT_IGNORE = [
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+  ".cache",
+  ".DS_Store",
+] as const
+
+export function normalizeOptions(
+  options?: E2BWorkspacePluginOptions,
+  localDirectory?: string,
+): NormalizedE2BWorkspaceConfig {
+  const sandboxTimeoutMs =
+    requirePositiveInteger(options?.sandboxTimeoutMs, "sandboxTimeoutMs") ?? 60 * 60 * 1000
+  const serverPort = requireTcpPort(options?.serverPort, "serverPort") ?? 4096
+  const waitForTimeoutMs =
+    requirePositiveInteger(options?.bootstrap?.waitForTimeoutMs, "bootstrap.waitForTimeoutMs") ?? 30_000
+  const batchSize = requirePositiveInteger(options?.upload?.batchSize, "upload.batchSize") ?? 100
+  const templateGcTtlMs = Math.max(
+    requirePositiveInteger(options?.templateGc?.ttlMs, "templateGc.ttlMs") ?? DEFAULT_TEMPLATE_GC_TTL_MS,
+    MIN_TEMPLATE_GC_TTL_MS,
+  )
+  const templateGcCooldownMs =
+    requirePositiveInteger(options?.templateGc?.cooldownMs, "templateGc.cooldownMs") ??
+    DEFAULT_TEMPLATE_GC_COOLDOWN_MS
+
+  const config = {
+    workspaceApiVersion: CURRENT_WORKSPACE_API_VERSION,
+    nodeVariant: options?.nodeVariant ?? DEFAULT_NODE_VARIANT,
+    sandboxTimeoutMs,
+    projectPath:
+      requireAbsoluteProjectPath(options?.projectPath, "projectPath") ??
+      mirroredProjectPath(localDirectory) ??
+      FALLBACK_PROJECT_PATH,
+    serverPort,
+    secure: options?.secure ?? true,
+    network: {
+      allowPublicTraffic: options?.network?.allowPublicTraffic ?? false,
+      allowOut: options?.network?.allowOut ?? [],
+      denyOut: options?.network?.denyOut ?? [],
+      maskRequestHost: options?.network?.maskRequestHost ?? "",
+    },
+    bootstrap: {
+      prepareCommands: options?.bootstrap?.prepareCommands ?? [],
+      installCommand: options?.bootstrap?.installCommand ?? "",
+      startCommand: options?.bootstrap?.startCommand ?? "",
+      waitForPath: options?.bootstrap?.waitForPath ?? "/global/health",
+      waitForTimeoutMs,
+    },
+    upload: {
+      ignore: options?.upload?.ignore ?? [...DEFAULT_IGNORE],
+      includeDotGit: options?.upload?.includeDotGit ?? false,
+      batchSize,
+      followSymlinks: options?.upload?.followSymlinks ?? false,
+    },
+    templateGc: {
+      enabled: options?.templateGc?.enabled !== false,
+      ttlMs: templateGcTtlMs,
+      cooldownMs: templateGcCooldownMs,
+    },
+    metadata: options?.metadata ?? {},
+    flags: [] as string[],
+  } satisfies NormalizedE2BWorkspaceConfig
+
+  return {
+    ...config,
+    flags: buildWorkspaceFlags(config),
+  }
+}
+
+export async function warnDeprecatedBootstrapOptions(
+  options: E2BWorkspacePluginOptions | undefined,
+  logger: PluginLogger | undefined,
+): Promise<void> {
+  const installCommand = options?.bootstrap?.installCommand?.trim()
+  const startCommand = options?.bootstrap?.startCommand?.trim()
+
+  if (installCommand) {
+    await logger?.warn(
+      "bootstrap.installCommand is deprecated and ignored; opencode is installed during managed-template build.",
+      {
+        installCommand,
+      },
+    )
+  }
+
+  if (startCommand) {
+    await logger?.warn(
+      "bootstrap.startCommand is deprecated and ignored; the managed template runs a marker-gated systemd service.",
+      {
+        startCommand,
+      },
+    )
+  }
+}
+
+export function resolveWorkspaceConfig(
+  info: WorkspaceRef,
+  options?: E2BWorkspacePluginOptions,
+): NormalizedE2BWorkspaceConfig {
+  const normalized = normalizeOptions(options)
+  const extra = readPersistedExtra(info)
+  if (!extra) return normalized
+
+  return {
+    ...normalized,
+    workspaceApiVersion: extra.e2b.workspaceApiVersion,
+    nodeVariant: extra.e2b.nodeVariant,
+    projectPath: extra.e2b.projectPath,
+    serverPort: extra.e2b.serverPort,
+    secure: extra.e2b.secure,
+    flags: extra.e2b.flags,
+    metadata: {
+      ...normalized.metadata,
+      ...extra.e2b.metadata,
+    },
+  }
+}
+
+export function defaultWorkspaceName(info: WorkspaceRef): string {
+  const branchPart = info.branch?.replace(/[^a-zA-Z0-9._-]+/g, "-")
+  const suffix = info.id.slice(-6)
+  return branchPart ? `e2b-${branchPart}` : `e2b-${suffix}`
+}
+
+export function readPersistedExtra(info: WorkspaceRef): PersistedWorkspaceExtra | undefined {
+  if (!info.extra || typeof info.extra !== "object") return undefined
+
+  const candidate = info.extra as Partial<PersistedWorkspaceExtra>
+  if (!candidate.e2b) return undefined
+  if (typeof candidate.e2b.workspaceApiVersion !== "string") return undefined
+  if (typeof candidate.e2b.runtimeVersion !== "string") return undefined
+  if (!Array.isArray(candidate.e2b.flags) || !candidate.e2b.flags.every((flag) => typeof flag === "string")) {
+    return undefined
+  }
+  if (typeof candidate.e2b.nodeVariant !== "string") return undefined
+  if (typeof candidate.e2b.projectPath !== "string") return undefined
+  if (typeof candidate.e2b.serverPort !== "number") return undefined
+  if (typeof candidate.e2b.secure !== "boolean") return undefined
+  if (!candidate.e2b.metadata || typeof candidate.e2b.metadata !== "object") return undefined
+
+  return candidate as PersistedWorkspaceExtra
+}
+
+function buildWorkspaceFlags(config: Omit<NormalizedE2BWorkspaceConfig, "flags">): string[] {
+  const flags = new Set<string>(["sync:local-snapshot-upload", "repo:git-init", "install:node-base"])
+
+  return [...flags]
+}
+
+function requirePositiveInteger(value: number | undefined, fieldName: string): number | undefined {
+  if (value === undefined) return undefined
+  if (Number.isInteger(value) && value > 0) {
+    return value
+  }
+
+  throw new Error(`Expected ${fieldName} to be a positive integer`)
+}
+
+function requireTcpPort(value: number | undefined, fieldName: string): number | undefined {
+  const port = requirePositiveInteger(value, fieldName)
+  if (port === undefined) return undefined
+  if (port > 65535) {
+    throw new Error(`Expected ${fieldName} to be between 1 and 65535`)
+  }
+  return port
+}
+
+function requireAbsoluteProjectPath(value: string | undefined, fieldName: string): string | undefined {
+  if (value === undefined) return undefined
+  if (value.trim() === "") {
+    throw new Error(`Expected ${fieldName} to be a non-empty string`)
+  }
+  if (!value.startsWith("/")) {
+    throw new Error(`Expected ${fieldName} to be an absolute POSIX path`)
+  }
+  if (value === "/") {
+    throw new Error(`Expected ${fieldName} to not be the filesystem root`)
+  }
+  // See config-validate.ts: ownership is guaranteed by chown in bootstrap, so
+  // projectPath is free to mirror the host path.
+  return value
+}
