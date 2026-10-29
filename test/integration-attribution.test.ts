@@ -9,7 +9,7 @@ import { ConnectionConfig } from "e2b"
 import "../dist/core/e2b-sdk.js"
 
 test("tags E2B requests with the plugin name and version for attribution", () => {
-  const { name, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+  const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
   const userAgent = new ConnectionConfig().headers?.["User-Agent"] ?? ""
-  assert.ok(userAgent.split(/\s+/).includes(`${name}/${version}`), `User-Agent was: ${userAgent}`)
+  assert.ok(userAgent.split(/\s+/).includes(`e2b-opencode/${version}`), `User-Agent was: ${userAgent}`)
 })
